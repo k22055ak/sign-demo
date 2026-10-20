@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>手話単語認識デモ</title>
+<style>
+  :root { --bg:#f6f7f9; --fg:#1b1f24; --sub:#5b6470; --card:#fff; --line:#d9dde3; --accent:#2a6df4; --rec:#d93838; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#121417; --fg:#e8eaed; --sub:#9aa3ad; --card:#1c1f24; --line:#333840; --accent:#5b8ff9; --rec:#ff5c5c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; background:var(--bg); color:var(--fg); }
+  main { max-width: 720px; margin: 0 auto; padding: 12px 16px 40px; }
+  h1 { font-size: 18px; margin: 4px 0 8px; }
+  .stage { position: relative; width: 100%; background:#000; border-radius: 10px; overflow: hidden; }
+  video, canvas.overlay { display:block; width:100%; height:auto; }
+  canvas.overlay { position:absolute; inset:0; height:100%; pointer-events:none; }
+  .mirror { transform: scaleX(-1); }
+  .badge { position:absolute; left:8px; top:8px; background:rgba(0,0,0,.55); color:#fff; font-size:12px; padding:3px 8px; border-radius:6px; }
+  .recdot { position:absolute; right:8px; top:8px; background:var(--rec); color:#fff; font-size:12px; padding:3px 8px; border-radius:6px; display:none; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0; }
+  button { flex:1 1 140px; min-height:44px; font-size:15px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  button.rec { background:var(--rec); color:#fff; border-color:var(--rec); }
+  button:disabled { opacity:.5; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:10px 0; }
+  .muted { color:var(--sub); font-size:13px; }
+  ol.top { margin:6px 0 0; padding-left:22px; }
+  ol.top li { margin:4px 0; }
+  .bar { height:6px; background:var(--line); border-radius:3px; margin-top:2px; }
+  .bar > span { display:block; height:100%; background:var(--accent); border-radius:3px; }
+  label { font-size:14px; display:flex; align-items:center; gap:6px; }
+  details summary { cursor:pointer; font-size:14px; }
+  pre { white-space:pre-wrap; font-size:12px; margin:6px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>手話単語認識デモ（WLASL100・DGT-STA）</h1>
+  <p class="muted" id="status">読み込み中…</p>
+
+  <div class="stage">
+    <video id="video" class="mirror" playsinline muted></video>
+    <canvas id="overlay" class="overlay mirror"></canvas>
+    <div class="badge" id="badge">-- fps</div>
+    <div class="recdot" id="recdot">● 録画中</div>
+  </div>
+
+  <div class="row">
+    <button id="btnCam" class="primary" disabled>カメラを開始</button>
+    <button id="btnRec" disabled>録画して判定</button>
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="chkLive"> リアルタイム判定（試験的）</label>
+  </div>
+
+  <div class="card">
+    <div class="muted" id="resultHead">結果はここに表示されます</div>
+    <ol class="top" id="result"></ol>
+  </div>
+
+  <details class="card">
+    <summary>精度の確認（テスト動画で評価）</summary>
+    <p class="muted">サーバーから持ってきたtestの動画（video_id.mp4）を複数選び、test_labels.json を選ぶと、
+      学習時と同じ正解率が出るか確認できます。PCのChromeでの実行がおすすめです。</p>
+    <div class="row">
+      <label>ラベル: <input type="file" id="fileLabels" accept=".json"></label>
+    </div>
+    <div class="row">
+      <label>動画: <input type="file" id="fileVideos" accept="video/*" multiple></label>
+    </div>
+    <div class="row">
+      <label>取り出し方
+        <select id="selRate">
+          <option value="seek" selected>1フレームずつ（確実）</option>
+          <option value="0.5">再生しながら 0.5倍速</option>
+          <option value="0.25">再生しながら 0.25倍速</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="chkSwap"> 左右の手を入れ替える（診断用）</label>
+    </div>
+    <div class="row">
+      <button id="btnEval" disabled>評価を開始</button>
+      <button id="btnDump" disabled>取り出した骨格を保存（最初の30本）</button>
+    </div>
+    <pre id="evalLog"></pre>
+  </details>
+
+  <details class="card">
+    <summary>使い方と注意</summary>
+    <ul class="muted">
+      <li>スマホは<strong>横向き</strong>にして、頭から腰までが映る距離で使ってください（学習データに近い構図になります）。</li>
+      <li>「録画して判定」を押してから手話を1語行い、もう一度押すと判定します。</li>
+      <li>画面は鏡のように左右反転して表示していますが、判定には反転していない映像を使っています。</li>
+    </ul>
+  </details>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
