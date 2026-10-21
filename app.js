@@ -3,8 +3,9 @@ import { FilesetResolver, HolisticLandmarker } from
 import { lmToArray, normalizeFrame, rawToFeatures, limitFrames, FEATURE_DIM } from "./features.js";
 
 const MP_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
-const HOLISTIC_MODEL =
-  "https://storage.googleapis.com/mediapipe-models/holistic_landmarker/holistic_landmarker/float16/latest/holistic_landmarker.task";
+// 学習データの抽出（Python版Tasks）と同じモデルファイルを、アプリと同じ場所に置いて使う。
+// （Googleの「latest」を直接読むと、将来中身が変わって学習時とずれるおそれがあるため）
+const HOLISTIC_MODEL = "./holistic_landmarker.task";
 const ORT_WASM = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
 const ONNX_MODEL = "./dgtsta_wlasl100.onnx";
 const GLOSSES = "./glosses.json";
