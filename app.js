@@ -1,4 +1,4 @@
-import { FilesetResolver, HolisticLandmarker } from
+import { FilesetResolver, HolisticLandmarker, PoseLandmarker, HandLandmarker } from
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 import { lmToArray, normalizeFrame, rawToFeatures, limitFrames, FEATURE_DIM } from "./features.js";
 
@@ -6,6 +6,13 @@ const MP_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wa
 // 学習データの抽出（Python版Tasks）と同じモデルファイルを、アプリと同じ場所に置いて使う。
 // （Googleの「latest」を直接読むと、将来中身が変わって学習時とずれるおそれがあるため）
 const HOLISTIC_MODEL = "./holistic_landmarker.task";
+// 「体＋手のみ」モード（速度の試算用）で使うモデル。判定の精度は保証しない
+const POSE_MODELS = {
+  lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+  full: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+};
+const HAND_MODEL =
+  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task";
 const ORT_WASM = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
 const ONNX_MODEL = "./dgtsta_wlasl100.onnx";
 const GLOSSES = "./glosses.json";
@@ -21,30 +28,85 @@ const ctx = overlay.getContext("2d");
 const setStatus = (s) => { $("status").textContent = s; };
 
 let vision, holistic, session, glosses, delegateUsed = "";
+let extractMode = "holistic";            // "holistic" | "lite" | "full"
+const poseLms = {}, poseDelegate = {};
+let handLm = null, handDelegate = "", switching = false;
 let lastTs = 0;
 let camRunning = false, recording = false, evalRunning = false;
 let recFrames = [], recStart = 0;
 let fps = 0, lastFrameAt = 0;
 let liveBuf = [], liveProbs = [], lastLiveAt = 0, liveBusy = false;
 
+// ---------- 処理時間の計測 ----------
+// 直近500回分を保存し、平均と中央値を出す（単位はミリ秒）
+const timing = {
+  data: {},
+  add(key, ms) {
+    const a = (this.data[key] ||= []);
+    a.push(ms);
+    if (a.length > 500) a.shift();
+  },
+  reset() { this.data = {}; },
+  stat(key) {
+    const a = this.data[key];
+    if (!a || !a.length) return null;
+    const s = [...a].sort((x, y) => x - y);
+    return { n: a.length, mean: a.reduce((p, c) => p + c, 0) / a.length, med: s[Math.floor(s.length / 2)] };
+  },
+};
+
 // ---------- 読み込み ----------
-async function createHolistic() {
+async function createTask(Cls, name, options) {
   for (const delegate of ["GPU", "CPU"]) {
     try {
-      const h = await HolisticLandmarker.createFromOptions(vision, {
-        baseOptions: { modelAssetPath: HOLISTIC_MODEL, delegate },
-        runningMode: "VIDEO",
-        minPoseDetectionConfidence: 0.5,
-        minPosePresenceConfidence: 0.5,
-        minHandLandmarksConfidence: 0.5,
+      const task = await Cls.createFromOptions(vision, {
+        ...options, baseOptions: { ...options.baseOptions, delegate },
       });
-      delegateUsed = delegate;
-      return h;
+      return { task, delegate };
     } catch (e) {
-      console.warn(`Holistic (${delegate}) の作成に失敗`, e);
+      console.warn(`${name} (${delegate}) の作成に失敗`, e);
     }
   }
-  throw new Error("MediaPipe Holistic を読み込めませんでした");
+  throw new Error(`${name} を読み込めませんでした`);
+}
+
+async function createHolistic() {
+  const { task, delegate } = await createTask(HolisticLandmarker, "MediaPipe Holistic", {
+    baseOptions: { modelAssetPath: HOLISTIC_MODEL },
+    runningMode: "VIDEO",
+    minPoseDetectionConfidence: 0.5,
+    minPosePresenceConfidence: 0.5,
+    minHandLandmarksConfidence: 0.5,
+  });
+  delegateUsed = delegate;
+  return task;
+}
+
+async function ensurePoseHand(kind) {
+  if (!poseLms[kind]) {
+    const { task, delegate } = await createTask(PoseLandmarker, `Pose(${kind})`, {
+      baseOptions: { modelAssetPath: POSE_MODELS[kind] },
+      runningMode: "VIDEO",
+      numPoses: 1,
+      minPoseDetectionConfidence: 0.5,
+      minPosePresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    poseLms[kind] = task;
+    poseDelegate[kind] = delegate;
+  }
+  if (!handLm) {
+    const { task, delegate } = await createTask(HandLandmarker, "Hand", {
+      baseOptions: { modelAssetPath: HAND_MODEL },
+      runningMode: "VIDEO",
+      numHands: 2,
+      minHandDetectionConfidence: 0.5,
+      minHandPresenceConfidence: 0.5,
+      minTrackingConfidence: 0.5,
+    });
+    handLm = task;
+    handDelegate = delegate;
+  }
 }
 
 async function init() {
@@ -58,7 +120,7 @@ async function init() {
     ort.env.wasm.numThreads = 1;
     session = await ort.InferenceSession.create(ONNX_MODEL, { executionProviders: ["wasm"] });
     glosses = await (await fetch(GLOSSES)).json();
-    await runModel(Array.from({ length: 30 }, () => new Float64Array(225)));  // ウォームアップ
+    await runModel(Array.from({ length: 30 }, () => new Float64Array(225)), false);  // ウォームアップ
 
     setStatus(`準備完了（MediaPipe: ${delegateUsed} / 単語数: ${glosses.length}）`);
     $("btnCam").disabled = false;
@@ -66,6 +128,36 @@ async function init() {
   } catch (e) {
     console.error(e);
     setStatus("読み込みに失敗しました: " + e.message);
+  }
+}
+
+function modeLabel(mode = extractMode) {
+  if (mode === "holistic") return `Holistic（学習と同じ、${delegateUsed}）`;
+  return `体(${mode})＋手のみ（速度の試算用、体:${poseDelegate[mode] || "-"} 手:${handDelegate || "-"}）`;
+}
+
+async function changeMode() {
+  const mode = $("selExtract").value;
+  switching = true;
+  $("selExtract").disabled = true;
+  try {
+    if (mode !== "holistic") {
+      setStatus("体と手のモデルを読み込み中…");
+      await ensurePoseHand(mode);
+    }
+    extractMode = mode;
+    timing.reset();
+    fps = 0; lastFrameAt = 0;
+    liveBuf = []; liveProbs = [];
+    setStatus(`骨格の抽出: ${modeLabel()}` +
+      (mode === "holistic" ? "" : " ※学習時と骨格の取り出し方が違うので、判定結果は参考外です"));
+  } catch (e) {
+    console.error(e);
+    setStatus("切り替えに失敗しました: " + e.message);
+    $("selExtract").value = extractMode;
+  } finally {
+    switching = false;
+    $("selExtract").disabled = false;
   }
 }
 
@@ -80,22 +172,71 @@ function hasHand(raw) {
   return false;
 }
 
-function processFrame(source) {
-  const res = holistic.detectForVideo(source, nextTs(performance.now()));
-  const pose = lmToArray(res.poseLandmarks?.[0], 33);
-  let lh = lmToArray(res.leftHandLandmarks?.[0], 21);
-  let rh = lmToArray(res.rightHandLandmarks?.[0], 21);
+// 「体＋手のみ」モード：検出した手を、体の手首（15=左、16=右）に近いほうへ割り当てる
+function assignHands(poseL, hands, handedness) {
+  let left = null, right = null;
+  if (!hands || !hands.length) return [left, right];
+  const d2 = (a, b) => (a.x - b.x) ** 2 + (a.y - b.y) ** 2;
+  if (poseL) {
+    const lw = poseL[15], rw = poseL[16];
+    if (hands.length === 1) {
+      d2(hands[0][0], lw) <= d2(hands[0][0], rw) ? (left = hands[0]) : (right = hands[0]);
+    } else {
+      const a = d2(hands[0][0], lw) + d2(hands[1][0], rw);
+      const b = d2(hands[1][0], lw) + d2(hands[0][0], rw);
+      [left, right] = a <= b ? [hands[0], hands[1]] : [hands[1], hands[0]];
+    }
+  } else {
+    // 体が取れないときは利き手の推定を使う（MediaPipeは鏡像を前提にするので、"Left"は本人の右手）
+    hands.forEach((h, i) => {
+      const lab = handedness?.[i]?.[0]?.categoryName;
+      if (lab === "Left") right = right || h; else left = left || h;
+    });
+  }
+  return [left, right];
+}
+
+function processFrame(source, mode = extractMode) {
+  const ts = nextTs(performance.now());
+  const t0 = performance.now();
+  let poseL, lhL, rhL;
+  if (mode === "holistic") {
+    const r = holistic.detectForVideo(source, ts);
+    timing.add("mp", performance.now() - t0);
+    poseL = r.poseLandmarks?.[0]; lhL = r.leftHandLandmarks?.[0]; rhL = r.rightHandLandmarks?.[0];
+  } else {
+    const rp = poseLms[mode].detectForVideo(source, ts);
+    const t1 = performance.now();
+    const rh = handLm.detectForVideo(source, ts);
+    const t2 = performance.now();
+    timing.add("pose", t1 - t0); timing.add("hand", t2 - t1); timing.add("mp", t2 - t0);
+    poseL = rp.landmarks?.[0];
+    [lhL, rhL] = assignHands(poseL, rh.landmarks, rh.handedness || rh.handednesses);
+  }
+  const t3 = performance.now();
+  const pose = lmToArray(poseL, 33);
+  let lh = lmToArray(lhL, 21);
+  let rh = lmToArray(rhL, 21);
   if ($("chkSwap").checked) [lh, rh] = [rh, lh];
-  return { raw: normalizeFrame(pose, lh, rh), res };
+  const raw = normalizeFrame(pose, lh, rh);
+  timing.add("norm", performance.now() - t3);
+  return { raw, res: { pose: poseL, lh: lhL, rh: rhL } };
 }
 
 // ---------- 認識モデル ----------
-async function runModel(frames) {
+async function runModel(frames, record = false) {
   const fr = limitFrames(frames, 300);
-  const x = new ort.Tensor("float32", rawToFeatures(fr), [1, fr.length, FEATURE_DIM]);
   const t0 = performance.now();
-  const out = await session.run({ skeleton: x });
-  return { probs: out.probs.data, ms: performance.now() - t0 };
+  const feat = rawToFeatures(fr);
+  const t1 = performance.now();
+  const out = await session.run({ skeleton: new ort.Tensor("float32", feat, [1, fr.length, FEATURE_DIM]) });
+  const t2 = performance.now();
+  if (record) {
+    timing.add("feat", t1 - t0);
+    timing.add("onnx", t2 - t1);
+    timing.add("recFrames", fr.length);
+  }
+  return { probs: out.probs.data, ms: t2 - t1 };
 }
 
 function topK(probs, k) {
@@ -108,6 +249,48 @@ function showResult(probs, head, k = 5) {
     `<li><strong>${glosses[i]}</strong> ${(p * 100).toFixed(1)}%` +
     `<div class="bar"><span style="width:${(p * 100).toFixed(1)}%"></span></div></li>`).join("");
 }
+
+// ---------- 処理時間の表示 ----------
+function timingText() {
+  const f = (s, d = 1) => (s ? `平均 ${s.mean.toFixed(d)} ms / 中央値 ${s.med.toFixed(d)} ms（${s.n}回）` : "まだありません");
+  const frame = timing.stat("frame"), mp = timing.stat("mp");
+  const lines = [];
+  lines.push(`端末: ${navigator.userAgent}`);
+  lines.push(`骨格の抽出: ${modeLabel()}`);
+  if (video.videoWidth) lines.push(`カメラ: ${video.videoWidth}×${video.videoHeight}`);
+  lines.push("");
+  lines.push("■ 1フレームごとの処理（カメラ動作中）");
+  lines.push(`  フレームの間隔: ${f(frame)}` + (frame ? `  → ${(1000 / frame.mean).toFixed(1)} fps` : ""));
+  lines.push(`  MediaPipe（骨格の抽出）: ${f(mp)}`);
+  if (extractMode !== "holistic") {
+    lines.push(`    うち 体: ${f(timing.stat("pose"))}`);
+    lines.push(`    うち 手: ${f(timing.stat("hand"))}`);
+  }
+  lines.push(`  正規化: ${f(timing.stat("norm"), 3)}`);
+  lines.push(`  画面への描画: ${f(timing.stat("draw"), 2)}`);
+  const rf = timing.stat("recFrames");
+  lines.push("");
+  lines.push("■ 判定（「録画して判定」1回ごと）" + (rf ? `  平均 ${rf.mean.toFixed(0)}フレーム` : ""));
+  lines.push(`  特徴量の計算（393次元）: ${f(timing.stat("feat"), 2)}`);
+  lines.push(`  DGT-STA（ONNX Runtime Web）: ${f(timing.stat("onnx"), 2)}`);
+  if (frame && mp) {
+    lines.push("");
+    lines.push(`→ 1フレームの間隔のうち、MediaPipeが ${(100 * mp.mean / frame.mean).toFixed(0)}% を占めています`);
+  }
+  return lines.join("\n");
+}
+
+function copyTiming() {
+  const text = timingText();
+  const ok = () => { $("btnCopyTiming").textContent = "コピーしました"; setTimeout(() => { $("btnCopyTiming").textContent = "結果をコピー"; }, 1500); };
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(ok, () => { $("timingLog").textContent = text; });
+  } else {
+    $("timingLog").textContent = text;
+  }
+}
+
+setInterval(() => { if (camRunning || timing.stat("onnx")) $("timingLog").textContent = timingText(); }, 1000);
 
 // ---------- 描画 ----------
 function draw(res) {
@@ -125,9 +308,9 @@ function draw(res) {
       ctx.fill();
     }
   };
-  dots(res.poseLandmarks?.[0]?.slice(0, 25), "rgba(255,255,255,.8)", 3);
-  dots(res.leftHandLandmarks?.[0], "#3ddc84", 3);
-  dots(res.rightHandLandmarks?.[0], "#ffb020", 3);
+  dots(res.pose?.slice(0, 25), "rgba(255,255,255,.8)", 3);
+  dots(res.lh, "#3ddc84", 3);
+  dots(res.rh, "#ffb020", 3);
 }
 
 // ---------- カメラ ----------
@@ -140,10 +323,12 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     camRunning = true;
+    timing.reset();
+    fps = 0; lastFrameAt = 0;
     $("btnCam").disabled = true;
     $("btnRec").disabled = false;
     const portrait = video.videoHeight > video.videoWidth;
-    setStatus(`カメラ ${video.videoWidth}×${video.videoHeight}（MediaPipe: ${delegateUsed}）` +
+    setStatus(`カメラ ${video.videoWidth}×${video.videoHeight}（${modeLabel()}）` +
       (portrait ? " ※縦向きです。横向きにすると学習データに近くなります" : ""));
     scheduleNext();
   } catch (e) {
@@ -171,14 +356,20 @@ function scheduleNext() {
 
 function onFrame() {
   if (!camRunning) return;
+  if (switching) { lastFrameAt = 0; scheduleNext(); return; }
   const now = performance.now();
   const { raw, res } = processFrame(video);
+  const td = performance.now();
   draw(res);
+  timing.add("draw", performance.now() - td);
 
-  if (lastFrameAt) fps = 0.9 * fps + 0.1 * (1000 / (now - lastFrameAt));
+  if (lastFrameAt) {
+    fps = 0.9 * fps + 0.1 * (1000 / (now - lastFrameAt));
+    timing.add("frame", now - lastFrameAt);
+  }
   lastFrameAt = now;
-  const L = res.leftHandLandmarks?.length ? "○" : "×";
-  const R = res.rightHandLandmarks?.length ? "○" : "×";
+  const L = res.lh ? "○" : "×";
+  const R = res.rh ? "○" : "×";
   $("badge").textContent = `${fps.toFixed(1)} fps ／ 左手${L} 右手${R}`;
 
   if (recording) {
@@ -210,7 +401,7 @@ async function toggleRecord() {
     return;
   }
   const handPct = (100 * frames.filter(hasHand).length) / frames.length;
-  const { probs, ms } = await runModel(frames);
+  const { probs, ms } = await runModel(frames, true);
   showResult(probs, `${frames.length}フレーム（${sec.toFixed(1)}秒、${(frames.length / sec).toFixed(1)}fps）・` +
     `手の検出 ${handPct.toFixed(0)}%・判定 ${ms.toFixed(1)}ms`);
 }
@@ -241,6 +432,7 @@ async function liveStep(raw, now) {
 }
 
 // ---------- 精度の確認（テスト動画） ----------
+// 評価では、選んでいるモードに関係なく、学習と同じ Holistic を使う
 function extractFromFile(file, rate) {
   return new Promise((resolve, reject) => {
     const v = document.createElement("video");
@@ -262,7 +454,7 @@ function extractFromFile(file, rate) {
     }, 1000);
     const cb = () => {
       if (finished) return;
-      frames.push(processFrame(v).raw);
+      frames.push(processFrame(v, "holistic").raw);
       lastProgress = performance.now();
       if (!v.ended) v.requestVideoFrameCallback(cb);
     };
@@ -301,7 +493,7 @@ async function extractBySeeking(file, nFrames) {
         v.onseeked = () => { clearTimeout(timer); resolve(); };
         v.currentTime = t;
       });
-      frames.push(processFrame(v).raw);
+      frames.push(processFrame(v, "holistic").raw);
     }
     return frames;
   } finally {
@@ -343,7 +535,7 @@ async function runEval() {
       `${n}本  Top-1 ${(top1 / n).toFixed(3)}  Top-5 ${(top5 / n).toFixed(3)}  ` +
       `フレームの取得率 ${(ratioSum / n).toFixed(3)}  処理速度 ${(frameSum / timeSum).toFixed(1)}fps` +
       `  （再生できず飛ばした動画 ${skipped.length}本）`;
-    log.textContent = (doneAll ? "【完了】" : "") + head + "\n\n" + lines.slice(-200).join("\n");
+    log.textContent = (doneAll ? "【完了】" : "") + head + "\n\n" + lines.join("\n");
   };
   try {
     for (const f of files) {
@@ -403,5 +595,8 @@ $("btnRec").onclick = toggleRecord;
 $("btnEval").onclick = runEval;
 $("btnDump").onclick = saveDump;
 $("chkLive").onchange = () => { liveBuf = []; liveProbs = []; };
+$("selExtract").onchange = changeMode;
+$("btnResetTiming").onclick = () => { timing.reset(); $("timingLog").textContent = timingText(); };
+$("btnCopyTiming").onclick = copyTiming;
 
 init();

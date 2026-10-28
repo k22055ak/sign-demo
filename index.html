@@ -61,6 +61,26 @@
   </div>
 
   <details class="card">
+    <summary>処理時間の内訳（計測）</summary>
+    <p class="muted">カメラを動かしたまま「録画して判定」を何回か行うと、骨格の抽出（MediaPipe）と判定（DGT-STA）の時間が
+      別々に集計されます。「結果をコピー」で、端末名と一緒にコピーできます。</p>
+    <div class="row">
+      <label>骨格の抽出
+        <select id="selExtract">
+          <option value="holistic" selected>Holistic（学習と同じ）</option>
+          <option value="full">体(full)＋手のみ（速度の試算用）</option>
+          <option value="lite">体(lite)＋手のみ（速度の試算用）</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <button id="btnResetTiming">計測をリセット</button>
+      <button id="btnCopyTiming">結果をコピー</button>
+    </div>
+    <pre id="timingLog">カメラを開始すると表示されます</pre>
+  </details>
+
+  <details class="card">
     <summary>精度の確認（テスト動画で評価）</summary>
     <p class="muted">サーバーから持ってきたtestの動画（video_id.mp4）を複数選び、test_labels.json を選ぶと、
       学習時と同じ正解率が出るか確認できます。PCのChromeでの実行がおすすめです。</p>
