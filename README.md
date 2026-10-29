@@ -12,10 +12,12 @@
 | features.js | 393次元の特徴量の計算（学習時のPythonと同じ計算。Pythonとの一致を確認済み） |
 | dgtsta_wlasl100.onnx | 認識モデル（サーバーの `deploy/` からコピーして置く） |
 | glosses.json | 単語の一覧（同上） |
+| pose_landmarker_full.task / hand_landmarker.task | 骨格の抽出に使うMediaPipeのモデル。学習データの抽出と同じファイル（サーバーの `models/` からコピー） |
+| holistic_landmarker.task | 速度の比較用（Holisticモードを使うときだけ必要） |
 
 ## 使っているもの
 
-- MediaPipe Tasks Vision 0.10.14（HolisticLandmarker、GPUが使えなければCPU）
+- MediaPipe Tasks Vision 0.10.14（PoseLandmarker full＋HandLandmarker、GPUが使えなければCPU）
 - ONNX Runtime Web 1.18.0（wasm、1スレッド）
 - どちらもCDN（jsDelivr）から、Holisticのモデルは Google のサーバーから読み込みます
 

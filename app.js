@@ -6,13 +6,14 @@ const MP_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wa
 // 学習データの抽出（Python版Tasks）と同じモデルファイルを、アプリと同じ場所に置いて使う。
 // （Googleの「latest」を直接読むと、将来中身が変わって学習時とずれるおそれがあるため）
 const HOLISTIC_MODEL = "./holistic_landmarker.task";
-// 「体＋手のみ」モード（速度の試算用）で使うモデル。判定の精度は保証しない
+// 学習データは「体(PoseLandmarker full)＋手(HandLandmarker)」で抽出した。同じモデルファイルをアプリの横に置いて使う。
+// Holistic と 体(lite) は、速さを比べるためだけに残している（判定は学習時と取り出し方が違うので参考外）
+const TRAIN_MODE = "full";
 const POSE_MODELS = {
+  full: "./pose_landmarker_full.task",
   lite: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
-  full: "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
 };
-const HAND_MODEL =
-  "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task";
+const HAND_MODEL = "./hand_landmarker.task";
 const ORT_WASM = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
 const ONNX_MODEL = "./dgtsta_wlasl100.onnx";
 const GLOSSES = "./glosses.json";
@@ -28,7 +29,7 @@ const ctx = overlay.getContext("2d");
 const setStatus = (s) => { $("status").textContent = s; };
 
 let vision, holistic, session, glosses, delegateUsed = "";
-let extractMode = "holistic";            // "holistic" | "lite" | "full"
+let extractMode = TRAIN_MODE;            // "full"（学習と同じ） | "lite" | "holistic"
 const poseLms = {}, poseDelegate = {};
 let handLm = null, handDelegate = "", switching = false;
 let lastTs = 0;
@@ -113,7 +114,7 @@ async function init() {
   try {
     setStatus("MediaPipe を読み込み中…");
     vision = await FilesetResolver.forVisionTasks(MP_WASM);
-    holistic = await createHolistic();
+    await ensurePoseHand(TRAIN_MODE);
 
     setStatus("認識モデルを読み込み中…");
     ort.env.wasm.wasmPaths = ORT_WASM;
@@ -122,7 +123,7 @@ async function init() {
     glosses = await (await fetch(GLOSSES)).json();
     await runModel(Array.from({ length: 30 }, () => new Float64Array(225)), false);  // ウォームアップ
 
-    setStatus(`準備完了（MediaPipe: ${delegateUsed} / 単語数: ${glosses.length}）`);
+    setStatus(`準備完了（骨格: ${modeLabel()} / 単語数: ${glosses.length}）`);
     $("btnCam").disabled = false;
     $("btnEval").disabled = false;
   } catch (e) {
@@ -132,25 +133,36 @@ async function init() {
 }
 
 function modeLabel(mode = extractMode) {
-  if (mode === "holistic") return `Holistic（学習と同じ、${delegateUsed}）`;
-  return `体(${mode})＋手のみ（速度の試算用、体:${poseDelegate[mode] || "-"} 手:${handDelegate || "-"}）`;
+  if (mode === "holistic") return `Holistic（速度の比較用、${delegateUsed || "-"}）`;
+  const role = mode === TRAIN_MODE ? "学習と同じ" : "速度の比較用";
+  return `体(${mode})＋手（${role}、体:${poseDelegate[mode] || "-"} 手:${handDelegate || "-"}）`;
+}
+
+async function ensureHolistic() {
+  if (!holistic) holistic = await createHolistic();
+}
+
+// 動画ごとに追跡をリセットする（学習データの抽出でも、動画ごとに作り直している）
+async function resetTrainTasks() {
+  poseLms[TRAIN_MODE]?.close(); delete poseLms[TRAIN_MODE];
+  handLm?.close(); handLm = null;
+  await ensurePoseHand(TRAIN_MODE);
 }
 
 async function setMode(mode) {
   switching = true;
   $("selExtract").disabled = true;
   try {
-    if (mode !== "holistic") {
-      setStatus("体と手のモデルを読み込み中…");
-      await ensurePoseHand(mode);
-    }
+    setStatus("骨格のモデルを読み込み中…");
+    if (mode === "holistic") await ensureHolistic();
+    else await ensurePoseHand(mode);
     extractMode = mode;
     $("selExtract").value = mode;
     timing.reset();
     fps = 0; lastFrameAt = 0;
     liveBuf = []; liveProbs = [];
     setStatus(`骨格の抽出: ${modeLabel()}` +
-      (mode === "holistic" ? "" : " ※学習時と骨格の取り出し方が違うので、判定結果は参考外です"));
+      (mode === TRAIN_MODE ? "" : " ※学習時と骨格の取り出し方が違うので、判定結果は参考外です"));
   } catch (e) {
     console.error(e);
     setStatus("切り替えに失敗しました: " + e.message);
@@ -168,7 +180,7 @@ function changeMode() {
 
 // ---------- 3つのモードを自動で比較 ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const BENCH_MODES = ["holistic", "full", "lite"];
+const BENCH_MODES = ["full", "lite", "holistic"];
 const BENCH_WARMUP_MS = 2000, BENCH_MEASURE_MS = 8000;
 let benchText = "", benchRunning = false;
 let recentRaw = [];                       // 判定時間の計測に使う、直近60フレームの骨格
@@ -181,9 +193,10 @@ async function runBench() {
   const startMode = extractMode;
   const rows = [];
   try {
-    $("timingLog").textContent = "体と手のモデルを読み込み中…";
+    $("timingLog").textContent = "比べるモデルを読み込み中…";
     await ensurePoseHand("full");
     await ensurePoseHand("lite");
+    await ensureHolistic();
     for (const [i, m] of BENCH_MODES.entries()) {
       await setMode(m);
       $("timingLog").textContent = `(${i + 1}/3) ${modeLabel(m)} を計測中…\n` +
@@ -223,12 +236,18 @@ async function runBench() {
     L.push("");
     L.push(`■ 判定（${frames.length}フレームの骨格で20回）`);
     L.push(`  特徴量の計算 ${feat ? feat.mean.toFixed(2) : "-"} ms ／ DGT-STA（ONNX） ${onnx ? onnx.mean.toFixed(2) : "-"} ms`);
-    const h = rows.find((r) => r.mode === "holistic");
-    if (h?.frameP && onnx) {
+    const h = rows.find((r) => r.mode === "holistic"), t = rows.find((r) => r.mode === TRAIN_MODE);
+    if (onnx) {
       L.push("");
-      L.push(`→ Holisticでは、1フレームの間隔 ${h.frameP.mean.toFixed(0)} ms のうちMediaPipeが ` +
-        `${(100 * h.mpP.mean / h.frameP.mean).toFixed(0)}%。判定1回（${onnx.mean.toFixed(1)} ms）は` +
-        `1フレームの間隔の ${(100 * onnx.mean / h.frameP.mean).toFixed(1)}% にあたります`);
+      for (const r of [h, t]) {
+        if (!r?.frameP) continue;
+        L.push(`→ ${r.label}: 1フレームの間隔 ${r.frameP.mean.toFixed(0)} ms のうちMediaPipeが ` +
+          `${(100 * r.mpP.mean / r.frameP.mean).toFixed(0)}%。判定1回（${onnx.mean.toFixed(1)} ms）は` +
+          `1フレームの間隔の ${(100 * onnx.mean / r.frameP.mean).toFixed(1)}% にあたります`);
+      }
+      if (h?.frameP && t?.frameP) {
+        L.push(`→ 学習と同じ体(full)＋手は、Holisticの ${(h.frameP.mean / t.frameP.mean).toFixed(2)} 倍の速さです`);
+      }
     }
     benchText = L.join("\n");
     $("timingLog").textContent = benchText;
@@ -529,7 +548,7 @@ async function liveStep(raw, now) {
 }
 
 // ---------- 精度の確認（テスト動画） ----------
-// 評価では、選んでいるモードに関係なく、学習と同じ Holistic を使う
+// 評価では、選んでいるモードに関係なく、学習と同じ「体(full)＋手」を使う
 function extractFromFile(file, rate) {
   return new Promise((resolve, reject) => {
     const v = document.createElement("video");
@@ -551,7 +570,7 @@ function extractFromFile(file, rate) {
     }, 1000);
     const cb = () => {
       if (finished) return;
-      frames.push(processFrame(v, "holistic").raw);
+      frames.push(processFrame(v, TRAIN_MODE).raw);
       lastProgress = performance.now();
       if (!v.ended) v.requestVideoFrameCallback(cb);
     };
@@ -590,7 +609,7 @@ async function extractBySeeking(file, nFrames) {
         v.onseeked = () => { clearTimeout(timer); resolve(); };
         v.currentTime = t;
       });
-      frames.push(processFrame(v, "holistic").raw);
+      frames.push(processFrame(v, TRAIN_MODE).raw);
     }
     return frames;
   } finally {
@@ -639,8 +658,7 @@ async function runEval() {
       const vid = f.name.replace(/\.[^.]+$/, "");
       if (!(vid in labels)) { lines.push(`${vid}: ラベルにないので飛ばしました`); render(false); continue; }
       const [gloss, nExpected] = labels[vid];
-      holistic.close();                       // 学習時と同じく、動画ごとに追跡をリセット
-      holistic = await createHolistic();
+      await resetTrainTasks();                // 学習時と同じく、動画ごとに追跡をリセット
       const t0 = performance.now();
       let frames;
       try {
