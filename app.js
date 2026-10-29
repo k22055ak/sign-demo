@@ -136,8 +136,7 @@ function modeLabel(mode = extractMode) {
   return `体(${mode})＋手のみ（速度の試算用、体:${poseDelegate[mode] || "-"} 手:${handDelegate || "-"}）`;
 }
 
-async function changeMode() {
-  const mode = $("selExtract").value;
+async function setMode(mode) {
   switching = true;
   $("selExtract").disabled = true;
   try {
@@ -146,6 +145,7 @@ async function changeMode() {
       await ensurePoseHand(mode);
     }
     extractMode = mode;
+    $("selExtract").value = mode;
     timing.reset();
     fps = 0; lastFrameAt = 0;
     liveBuf = []; liveProbs = [];
@@ -155,9 +155,91 @@ async function changeMode() {
     console.error(e);
     setStatus("切り替えに失敗しました: " + e.message);
     $("selExtract").value = extractMode;
+    throw e;
   } finally {
     switching = false;
     $("selExtract").disabled = false;
+  }
+}
+
+function changeMode() {
+  setMode($("selExtract").value).catch(() => {});
+}
+
+// ---------- 3つのモードを自動で比較 ----------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const BENCH_MODES = ["holistic", "full", "lite"];
+const BENCH_WARMUP_MS = 2000, BENCH_MEASURE_MS = 8000;
+let benchText = "", benchRunning = false;
+let recentRaw = [];                       // 判定時間の計測に使う、直近60フレームの骨格
+
+async function runBench() {
+  if (!camRunning) { $("timingLog").textContent = "先に「カメラを開始」を押してください"; return; }
+  if (benchRunning) return;
+  benchRunning = true;
+  $("btnBench").disabled = true;
+  const startMode = extractMode;
+  const rows = [];
+  try {
+    $("timingLog").textContent = "体と手のモデルを読み込み中…";
+    await ensurePoseHand("full");
+    await ensurePoseHand("lite");
+    for (const [i, m] of BENCH_MODES.entries()) {
+      await setMode(m);
+      $("timingLog").textContent = `(${i + 1}/3) ${modeLabel(m)} を計測中…\n` +
+        "カメラに上半身と両手が映った状態で、手話のように手を動かし続けてください";
+      await sleep(BENCH_WARMUP_MS);       // 切り替え直後の不安定な分は捨てる
+      timing.reset();
+      await sleep(BENCH_MEASURE_MS);
+      const all = timing.stat("frame"), fp = timing.stat("frameP");
+      rows.push({
+        mode: m, label: modeLabel(m), frameP: fp, mpP: timing.stat("mpP"),
+        pose: timing.stat("poseP"), hand: timing.stat("handP"),
+        person: all && fp ? fp.n / all.n : 0, hands: timing.stat("handsP"),
+      });
+    }
+    // 判定の時間：直近の骨格（60フレーム）で20回判定して測る
+    const frames = recentRaw.length >= 10 ? recentRaw.slice()
+      : Array.from({ length: 60 }, () => new Float64Array(225));
+    timing.reset();
+    for (let k = 0; k < 20; k++) await runModel(frames, true);
+    const feat = timing.stat("feat"), onnx = timing.stat("onnx");
+
+    const ms = (s) => (s ? `${s.mean.toFixed(1)} ms` : "-");
+    const L = [];
+    L.push(`端末: ${navigator.userAgent}`);
+    if (video.videoWidth) L.push(`カメラ: ${video.videoWidth}×${video.videoHeight}`);
+    L.push("");
+    L.push(`■ 骨格の抽出の比較（人が映っているフレームだけで集計、各${BENCH_MEASURE_MS / 1000}秒）`);
+    for (const r of rows) {
+      L.push(`【${r.label}】`);
+      if (!r.frameP) { L.push("  人が映っているフレームがありませんでした"); continue; }
+      L.push(`  ${(1000 / r.frameP.mean).toFixed(1)} fps（フレームの間隔 ${ms(r.frameP)}）` +
+        `  MediaPipe ${ms(r.mpP)}` +
+        (r.pose ? `（体 ${ms(r.pose)} ＋ 手 ${ms(r.hand)}）` : "") +
+        `  人が映っていた割合 ${(100 * r.person).toFixed(0)}%` +
+        (r.hands ? `  手の検出 平均${r.hands.mean.toFixed(2)}本` : ""));
+    }
+    L.push("");
+    L.push(`■ 判定（${frames.length}フレームの骨格で20回）`);
+    L.push(`  特徴量の計算 ${feat ? feat.mean.toFixed(2) : "-"} ms ／ DGT-STA（ONNX） ${onnx ? onnx.mean.toFixed(2) : "-"} ms`);
+    const h = rows.find((r) => r.mode === "holistic");
+    if (h?.frameP && onnx) {
+      L.push("");
+      L.push(`→ Holisticでは、1フレームの間隔 ${h.frameP.mean.toFixed(0)} ms のうちMediaPipeが ` +
+        `${(100 * h.mpP.mean / h.frameP.mean).toFixed(0)}%。判定1回（${onnx.mean.toFixed(1)} ms）は` +
+        `1フレームの間隔の ${(100 * onnx.mean / h.frameP.mean).toFixed(1)}% にあたります`);
+    }
+    benchText = L.join("\n");
+    $("timingLog").textContent = benchText;
+  } catch (e) {
+    console.error(e);
+    $("timingLog").textContent = "計測に失敗しました: " + e.message;
+  } finally {
+    try { await setMode(startMode); } catch (e) { /* 元のモードに戻せなくても続ける */ }
+    if (benchText) $("timingLog").textContent = benchText;
+    benchRunning = false;
+    $("btnBench").disabled = false;
   }
 }
 
@@ -196,10 +278,12 @@ function assignHands(poseL, hands, handedness) {
   return [left, right];
 }
 
+let lastPoseMs = null, lastHandMs = null;
 function processFrame(source, mode = extractMode) {
   const ts = nextTs(performance.now());
   const t0 = performance.now();
   let poseL, lhL, rhL;
+  lastPoseMs = null; lastHandMs = null;
   if (mode === "holistic") {
     const r = holistic.detectForVideo(source, ts);
     timing.add("mp", performance.now() - t0);
@@ -210,6 +294,7 @@ function processFrame(source, mode = extractMode) {
     const rh = handLm.detectForVideo(source, ts);
     const t2 = performance.now();
     timing.add("pose", t1 - t0); timing.add("hand", t2 - t1); timing.add("mp", t2 - t0);
+    lastPoseMs = t1 - t0; lastHandMs = t2 - t1;
     poseL = rp.landmarks?.[0];
     [lhL, rhL] = assignHands(poseL, rh.landmarks, rh.handedness || rh.handednesses);
   }
@@ -220,7 +305,8 @@ function processFrame(source, mode = extractMode) {
   if ($("chkSwap").checked) [lh, rh] = [rh, lh];
   const raw = normalizeFrame(pose, lh, rh);
   timing.add("norm", performance.now() - t3);
-  return { raw, res: { pose: poseL, lh: lhL, rh: rhL } };
+  const mpMs = t3 - t0;
+  return { raw, res: { pose: poseL, lh: lhL, rh: rhL }, mpMs, poseMs: lastPoseMs, handMs: lastHandMs };
 }
 
 // ---------- 認識モデル ----------
@@ -281,7 +367,7 @@ function timingText() {
 }
 
 function copyTiming() {
-  const text = timingText();
+  const text = benchText || timingText();
   const ok = () => { $("btnCopyTiming").textContent = "コピーしました"; setTimeout(() => { $("btnCopyTiming").textContent = "結果をコピー"; }, 1500); };
   if (navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(text).then(ok, () => { $("timingLog").textContent = text; });
@@ -290,7 +376,10 @@ function copyTiming() {
   }
 }
 
-setInterval(() => { if (camRunning || timing.stat("onnx")) $("timingLog").textContent = timingText(); }, 1000);
+setInterval(() => {
+  if (benchRunning || benchText) return;   // 自動比較の途中・結果表示中は上書きしない
+  if (camRunning || timing.stat("onnx")) $("timingLog").textContent = timingText();
+}, 1000);
 
 // ---------- 描画 ----------
 function draw(res) {
@@ -358,14 +447,22 @@ function onFrame() {
   if (!camRunning) return;
   if (switching) { lastFrameAt = 0; scheduleNext(); return; }
   const now = performance.now();
-  const { raw, res } = processFrame(video);
+  const { raw, res, mpMs, poseMs, handMs } = processFrame(video);
   const td = performance.now();
   draw(res);
   timing.add("draw", performance.now() - td);
+  recentRaw.push(raw);
+  if (recentRaw.length > 60) recentRaw.shift();
 
   if (lastFrameAt) {
     fps = 0.9 * fps + 0.1 * (1000 / (now - lastFrameAt));
     timing.add("frame", now - lastFrameAt);
+    if (res.pose) {                       // 人が映っているフレームだけの集計
+      timing.add("frameP", now - lastFrameAt);
+      timing.add("mpP", mpMs);
+      if (poseMs !== null) { timing.add("poseP", poseMs); timing.add("handP", handMs); }
+      timing.add("handsP", (res.lh ? 1 : 0) + (res.rh ? 1 : 0));
+    }
   }
   lastFrameAt = now;
   const L = res.lh ? "○" : "×";
@@ -596,7 +693,8 @@ $("btnEval").onclick = runEval;
 $("btnDump").onclick = saveDump;
 $("chkLive").onchange = () => { liveBuf = []; liveProbs = []; };
 $("selExtract").onchange = changeMode;
-$("btnResetTiming").onclick = () => { timing.reset(); $("timingLog").textContent = timingText(); };
+$("btnResetTiming").onclick = () => { timing.reset(); benchText = ""; $("timingLog").textContent = timingText(); };
+$("btnBench").onclick = runBench;
 $("btnCopyTiming").onclick = copyTiming;
 
 init();

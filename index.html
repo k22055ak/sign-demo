@@ -63,7 +63,9 @@
   <details class="card">
     <summary>処理時間の内訳（計測）</summary>
     <p class="muted">カメラを動かしたまま「録画して判定」を何回か行うと、骨格の抽出（MediaPipe）と判定（DGT-STA）の時間が
-      別々に集計されます。「結果をコピー」で、端末名と一緒にコピーできます。</p>
+      別々に集計されます。「3つのモードを自動で比較」を押すと、骨格の抽出の方式を順に切り替えて、
+      それぞれ人が映っているときの速さを測ります（上半身と両手を映して、手を動かし続けてください）。
+      「結果をコピー」で、端末名と一緒にコピーできます。</p>
     <div class="row">
       <label>骨格の抽出
         <select id="selExtract">
@@ -72,6 +74,9 @@
           <option value="lite">体(lite)＋手のみ（速度の試算用）</option>
         </select>
       </label>
+    </div>
+    <div class="row">
+      <button id="btnBench" class="primary">3つのモードを自動で比較（約40秒）</button>
     </div>
     <div class="row">
       <button id="btnResetTiming">計測をリセット</button>
