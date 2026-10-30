@@ -57,12 +57,16 @@ const timing = {
 };
 
 // ---------- 読み込み ----------
+const withTimeout = (p, ms, msg) =>
+  Promise.race([p, new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms))]);
+
 async function createTask(Cls, name, options) {
   for (const delegate of ["GPU", "CPU"]) {
     try {
-      const task = await Cls.createFromOptions(vision, {
+      // GPUでの準備が終わらないまま止まることがあるので、30秒で見切ってCPUに切り替える
+      const task = await withTimeout(Cls.createFromOptions(vision, {
         ...options, baseOptions: { ...options.baseOptions, delegate },
-      });
+      }), 30000, `${name}（${delegate}）の読み込みが30秒で終わりませんでした`);
       return { task, delegate };
     } catch (e) {
       console.warn(`${name} (${delegate}) の作成に失敗`, e);
@@ -138,6 +142,10 @@ function modeLabel(mode = extractMode) {
   return `体(${mode})＋手（${role}、体:${poseDelegate[mode] || "-"} 手:${handDelegate || "-"}）`;
 }
 
+function modeShort(mode = extractMode) {
+  return mode === "holistic" ? "Holistic" : `体${mode}＋手`;
+}
+
 async function ensureHolistic() {
   if (!holistic) holistic = await createHolistic();
 }
@@ -193,12 +201,14 @@ async function runBench() {
   const startMode = extractMode;
   const rows = [];
   try {
-    $("timingLog").textContent = "比べるモデルを読み込み中…";
-    await ensurePoseHand("full");
-    await ensurePoseHand("lite");
-    await ensureHolistic();
     for (const [i, m] of BENCH_MODES.entries()) {
-      await setMode(m);
+      $("timingLog").textContent = `(${i + 1}/3) ${modeShort(m)} のモデルを読み込み中…（初回は数十秒かかることがあります）`;
+      try {
+        await setMode(m);
+      } catch (e) {
+        rows.push({ mode: m, label: modeShort(m), error: e.message });
+        continue;
+      }
       $("timingLog").textContent = `(${i + 1}/3) ${modeLabel(m)} を計測中…\n` +
         "カメラに上半身と両手が映った状態で、手話のように手を動かし続けてください";
       await sleep(BENCH_WARMUP_MS);       // 切り替え直後の不安定な分は捨てる
@@ -226,6 +236,7 @@ async function runBench() {
     L.push(`■ 骨格の抽出の比較（人が映っているフレームだけで集計、各${BENCH_MEASURE_MS / 1000}秒）`);
     for (const r of rows) {
       L.push(`【${r.label}】`);
+      if (r.error) { L.push(`  読み込めなかったので飛ばしました: ${r.error}`); continue; }
       if (!r.frameP) { L.push("  人が映っているフレームがありませんでした"); continue; }
       L.push(`  ${(1000 / r.frameP.mean).toFixed(1)} fps（フレームの間隔 ${ms(r.frameP)}）` +
         `  MediaPipe ${ms(r.mpP)}` +
@@ -486,7 +497,7 @@ function onFrame() {
   lastFrameAt = now;
   const L = res.lh ? "○" : "×";
   const R = res.rh ? "○" : "×";
-  $("badge").textContent = `${fps.toFixed(1)} fps ／ 左手${L} 右手${R}`;
+  $("badge").textContent = `${modeShort()} ／ ${fps.toFixed(1)} fps ／ 左手${L} 右手${R}`;
 
   if (recording) {
     recFrames.push(raw);
